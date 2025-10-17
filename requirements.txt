@@ -1,0 +1,21 @@
+# Bot Discord
+discord.py
+python-dotenv
+
+# API web
+fastapi
+uvicorn[standard]
+
+# Requêtes HTTP (Discord OAuth2, PayPal API, etc.)
+httpx
+aiohttp
+
+# Base de données (utile si tu veux stocker joueurs, dons, etc.)
+asyncpg   # pour PostgreSQL (Railway en fournit)
+sqlalchemy
+databases
+
+# Outils divers
+pydantic  # gestion de modèles pour FastAPI
+
+pyjwt[crypto]
