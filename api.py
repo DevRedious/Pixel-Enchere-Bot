@@ -62,17 +62,24 @@ class DatabasePool:
         from urllib.parse import urlparse
         parsed = urlparse(DATABASE_URL)
         
-        self.pool = await aiomysql.create_pool(
-            host=parsed.hostname,
-            port=parsed.port or 3306,
-            user=parsed.username,
-            password=parsed.password,
-            db=parsed.path[1:],  # Remove leading slash
-            minsize=5,
-            maxsize=20,
-            autocommit=True
-        )
-        logger.info("MySQL pool initialized")
+        logger.info(f"🔗 Tentative connexion MySQL: {parsed.hostname}:{parsed.port or 3306} DB:{parsed.path[1:]} User:{parsed.username}")
+        
+        try:
+            self.pool = await aiomysql.create_pool(
+                host=parsed.hostname,
+                port=parsed.port or 3306,
+                user=parsed.username,
+                password=parsed.password,
+                db=parsed.path[1:],  # Remove leading slash
+                minsize=5,
+                maxsize=20,
+                autocommit=True
+            )
+            logger.info("✅ MySQL pool initialized successfully")
+        except Exception as e:
+            logger.error(f"❌ MySQL connection failed: {e}")
+            logger.error(f"🔧 Check: Host={parsed.hostname}, Port={parsed.port or 3306}, User={parsed.username}, DB={parsed.path[1:]}")
+            raise
     
     async def get_connection(self):
         if not self.pool:
