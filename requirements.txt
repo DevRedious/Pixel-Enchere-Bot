@@ -1,21 +1,17 @@
 # Bot Discord
-discord.py
-python-dotenv
+discord.py==2.3.2
+python-dotenv==1.0.0
 
 # API web
-fastapi
-uvicorn[standard]
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
 
-# Requêtes HTTP (Discord OAuth2, PayPal API, etc.)
-httpx
-aiohttp
+# Requêtes HTTP 
+httpx==0.25.2
 
-# Base de données (utile si tu veux stocker joueurs, dons, etc.)
-asyncpg   # pour PostgreSQL (Railway en fournit)
-sqlalchemy
-databases
+# Base de données MySQL
+aiomysql==0.2.0
 
 # Outils divers
-pydantic  # gestion de modèles pour FastAPI
-
-pyjwt[crypto]
+pydantic==2.5.0
+pyjwt[crypto]==2.8.0

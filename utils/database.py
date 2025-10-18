@@ -1,8 +1,9 @@
 # ===== GESTIONNAIRE DE BASE DE DONNÉES OPTIMISÉ =====
-import asyncpg
+import aiomysql
 import logging
 from typing import Optional, Any, List, Dict
 from contextlib import asynccontextmanager
+from urllib.parse import urlparse
 
 logger = logging.getLogger('DatabaseManager')
 
@@ -10,22 +11,28 @@ class DatabaseManager:
     """Gestionnaire optimisé pour les connexions de base de données"""
     
     def __init__(self):
-        self.pool: Optional[asyncpg.Pool] = None
+        self.pool: Optional[aiomysql.Pool] = None
         self._database_url: Optional[str] = None
     
     async def initialize(self, database_url: str, min_size: int = 5, max_size: int = 20):
         """Initialise le pool de connexions"""
         self._database_url = database_url
         try:
-            self.pool = await asyncpg.create_pool(
-                database_url,
-                min_size=min_size,
-                max_size=max_size,
-                command_timeout=30.0
+            # Parse MySQL URL: mysql://user:password@host:port/database
+            parsed = urlparse(database_url)
+            self.pool = await aiomysql.create_pool(
+                host=parsed.hostname,
+                port=parsed.port or 3306,
+                user=parsed.username,
+                password=parsed.password,
+                db=parsed.path[1:],  # Remove leading slash
+                minsize=min_size,
+                maxsize=max_size,
+                autocommit=True
             )
-            logger.info(f"📦 Pool DB initialisé ({min_size}-{max_size} connexions)")
+            logger.info(f"📦 Pool MySQL initialisé ({min_size}-{max_size} connexions)")
         except Exception as e:
-            logger.error(f"❌ Erreur initialisation pool DB: {e}")
+            logger.error(f"❌ Erreur initialisation pool MySQL: {e}")
             raise
     
     async def close(self):
@@ -51,34 +58,46 @@ class DatabaseManager:
         async with self.pool.acquire() as conn:
             yield conn
     
-    async def execute(self, query: str, *args) -> str:
+    async def execute(self, query: str, *args) -> int:
         """Exécute une requête"""
         async with self.get_connection() as conn:
-            return await conn.execute(query, *args)
+            async with conn.cursor() as cursor:
+                await cursor.execute(query, args)
+                return cursor.rowcount
     
     async def fetchrow(self, query: str, *args) -> Optional[Dict]:
         """Récupère une seule ligne"""
         async with self.get_connection() as conn:
-            row = await conn.fetchrow(query, *args)
-            return dict(row) if row else None
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, args)
+                return await cursor.fetchone()
     
     async def fetch(self, query: str, *args) -> List[Dict]:
         """Récupère plusieurs lignes"""
         async with self.get_connection() as conn:
-            rows = await conn.fetch(query, *args)
-            return [dict(row) for row in rows]
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(query, args)
+                return await cursor.fetchall()
     
     async def fetchval(self, query: str, *args) -> Any:
         """Récupère une seule valeur"""
         async with self.get_connection() as conn:
-            return await conn.fetchval(query, *args)
+            async with conn.cursor() as cursor:
+                await cursor.execute(query, args)
+                row = await cursor.fetchone()
+                return row[0] if row else None
     
     @asynccontextmanager
     async def transaction(self):
         """Context manager pour les transactions"""
         async with self.get_connection() as conn:
-            async with conn.transaction():
+            try:
+                await conn.begin()
                 yield conn
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
 
 # Instance globale
 db = DatabaseManager()

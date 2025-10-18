@@ -4,7 +4,7 @@ import json
 import discord
 import threading
 import uvicorn
-import asyncpg
+import aiomysql
 import httpx
 import logging
 import hashlib
@@ -79,13 +79,13 @@ async def save_active_auction_state(thread_id: int, auction_data: dict):
     """Sauvegarde l'état d'une enchère active en BDD pour récupération"""
     try:
         async with db.get_connection() as conn:
-            await conn.execute("""
+            await db.execute("""
                 INSERT INTO active_auctions (thread_id, auction_data, created_at)
-                VALUES ($1, $2, $3)
+                VALUES (%s, %s, %s)
                 ON CONFLICT (thread_id) 
                 DO UPDATE SET 
-                    auction_data = $2,
-                    updated_at = $3
+                    auction_data = %s,
+                    updated_at = %s
             """, thread_id, json.dumps(auction_data), datetime.utcnow())
             
         active_auctions_cache[thread_id] = auction_data
@@ -97,7 +97,7 @@ async def load_active_auctions_state():
     """Charge toutes les enchères actives depuis la BDD"""
     try:
         async with db.get_connection() as conn:
-            rows = await conn.fetch("SELECT thread_id, auction_data FROM active_auctions")
+            rows = await db.fetch("SELECT thread_id, auction_data FROM active_auctions")
             
         loaded_count = 0
         for row in rows:
@@ -116,7 +116,7 @@ async def remove_active_auction_state(thread_id: int):
     """Supprime l'état d'une enchère terminée"""
     try:
         async with db.get_connection() as conn:
-            await conn.execute("DELETE FROM active_auctions WHERE thread_id = $1", thread_id)
+            await db.execute("DELETE FROM active_auctions WHERE thread_id = %s", thread_id)
             
         if thread_id in active_auctions_cache:
             del active_auctions_cache[thread_id]
@@ -288,11 +288,11 @@ async def get_user_tribe(user_id: int) -> dict:
     """Récupère la tribu d'un utilisateur"""
     try:
         async with db.get_connection() as conn:
-            result = await conn.fetchrow("""
+            result = await db.fetchrow("""
                 SELECT t.id, t.name, t.leader_id, tm.role
                 FROM tribes t
                 JOIN tribe_members tm ON t.id = tm.tribe_id
-                WHERE tm.user_id = $1
+                WHERE tm.user_id = %s
             """, user_id)
             
             if result:
@@ -314,11 +314,11 @@ async def can_user_act_for_user(acting_user_id: int, target_user_id: int) -> boo
     try:
         async with db.get_connection() as conn:
             # Vérifier s'ils sont dans la même tribu
-            result = await conn.fetchval("""
+            result = await db.fetchval("""
                 SELECT COUNT(*)
                 FROM tribe_members tm1
                 JOIN tribe_members tm2 ON tm1.tribe_id = tm2.tribe_id
-                WHERE tm1.user_id = $1 AND tm2.user_id = $2
+                WHERE tm1.user_id = %s AND tm2.user_id = %s
             """, acting_user_id, target_user_id)
             
             return result > 0
@@ -330,10 +330,10 @@ async def get_tribe_members(tribe_id: int) -> list:
     """Récupère tous les membres d'une tribu"""
     try:
         async with db.get_connection() as conn:
-            results = await conn.fetch("""
+            results = await db.fetch("""
                 SELECT tm.user_id, tm.role, tm.joined_at
                 FROM tribe_members tm
-                WHERE tm.tribe_id = $1
+                WHERE tm.tribe_id = %s
                 ORDER BY tm.role DESC, tm.joined_at ASC
             """, tribe_id)
             
@@ -1249,22 +1249,22 @@ async def admin_add_money(interaction: discord.Interaction, joueur: discord.Memb
     
     async with db.get_connection() as conn:
         # Ajouter l'argent au joueur
-        await conn.execute("""
-            INSERT INTO players (discord_id, username, ark_name, balance) VALUES ($1, $2, $3, $4)
-            ON CONFLICT (discord_id) DO UPDATE SET 
-                balance = players.balance + $4,
-                username = $2,
+        await db.execute("""
+            INSERT INTO players (discord_id, username, ark_name, balance) VALUES (%s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE 
+                balance = players.balance + %s,
+                username = %s,
                 updated_at = NOW()
         """, joueur.id, joueur.name, joueur.display_name, montant)
         
         # Enregistrer la transaction pour l'historique
-        await conn.execute("""
+        await db.execute("""
             INSERT INTO transactions (to_user_id, amount, transaction_type, description, admin_id)
-            VALUES ($1, $2, 'admin_add', $3, $4)
+            VALUES (%s, %s, 'admin_add', %s, %s)
         """, joueur.id, montant, raison, interaction.user.id)
         
         # Récupérer le nouveau solde
-        nouveau_solde = await conn.fetchval("SELECT balance FROM players WHERE discord_id = $1", joueur.id)
+        nouveau_solde = await db.fetchval("SELECT balance FROM players WHERE discord_id = %s", joueur.id)
         
         # Utiliser l'embed optimisé
         embed = EmbedBuilder.admin_action(
@@ -1291,7 +1291,7 @@ async def admin_remove_money(interaction: discord.Interaction, joueur: discord.M
     
     async with db.get_connection() as conn:
         # Vérifier le solde actuel
-        solde_actuel = await conn.fetchval("SELECT balance FROM players WHERE discord_id = $1", joueur.id)
+        solde_actuel = await db.fetchval("SELECT balance FROM players WHERE discord_id = %s", joueur.id)
         if not solde_actuel:
             await interaction.response.send_message(
                 embed=quick_error("Compte introuvable", f"{joueur.mention} n'a pas de compte."), 
@@ -1308,16 +1308,16 @@ async def admin_remove_money(interaction: discord.Interaction, joueur: discord.M
             return
         
         # Retirer l'argent
-        await conn.execute("UPDATE players SET balance = balance - $1, updated_at = NOW() WHERE discord_id = $2", montant, joueur.id)
+        await db.execute("UPDATE players SET balance = balance - %s, updated_at = NOW() WHERE discord_id = %s", montant, joueur.id)
         
         # Enregistrer la transaction
-        await conn.execute("""
+        await db.execute("""
             INSERT INTO transactions (from_user_id, amount, transaction_type, description, admin_id)
-            VALUES ($1, $2, 'admin_remove', $3, $4)
+            VALUES (%s, %s, 'admin_remove', %s, %s)
         """, joueur.id, montant, raison, interaction.user.id)
         
         # Récupérer le nouveau solde
-        nouveau_solde = await conn.fetchval("SELECT balance FROM players WHERE discord_id = $1", joueur.id)
+        nouveau_solde = await db.fetchval("SELECT balance FROM players WHERE discord_id = %s", joueur.id)
         
         # Utiliser l'embed optimisé
         embed = EmbedBuilder.admin_action(
@@ -1342,30 +1342,26 @@ async def admin_set_money(interaction: discord.Interaction, joueur: discord.Memb
         return
     
     try:
-        conn = await asyncpg.connect(DATABASE_URL)
-        
         # Récupérer le solde actuel
-        ancien_solde = await conn.fetchval("SELECT balance FROM players WHERE discord_id = $1", joueur.id)
+        ancien_solde = await db.fetchval("SELECT balance FROM players WHERE discord_id = %s", joueur.id)
         if ancien_solde is None:
             ancien_solde = 0
         
         # Définir le nouveau solde
-        await conn.execute("""
-            INSERT INTO players (discord_id, username, ark_name, balance) VALUES ($1, $2, $3, $4)
-            ON CONFLICT (discord_id) DO UPDATE SET 
-                balance = $4,
-                username = $2,
+        await db.execute("""
+            INSERT INTO players (discord_id, username, ark_name, balance) VALUES (%s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE 
+                balance = VALUES(balance),
+                username = VALUES(username),
                 updated_at = NOW()
         """, joueur.id, joueur.name, joueur.display_name, montant)
         
         # Enregistrer la transaction
         difference = montant - ancien_solde
-        await conn.execute("""
+        await db.execute("""
             INSERT INTO transactions (to_user_id, amount, transaction_type, description, admin_id)
-            VALUES ($1, $2, 'admin_set', $3, $4)
+            VALUES (%s, %s, 'admin_set', %s, %s)
         """, joueur.id, difference, f"{raison} (ancien: {ancien_solde:,}, nouveau: {montant:,})", interaction.user.id)
-        
-        await conn.close()
         
         embed = discord.Embed(
             title="⚖️ Solde Défini",
@@ -1380,7 +1376,7 @@ async def admin_set_money(interaction: discord.Interaction, joueur: discord.Memb
         
         await interaction.response.send_message(embed=embed, ephemeral=True)
         
-    except asyncpg.exceptions.PostgresError as e:
+    except aiomysql.Error as e:
         await interaction.response.send_message(f"❌ Erreur base de données : {e}", ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(f"❌ Erreur inattendue : {e}", ephemeral=True)
@@ -1391,26 +1387,26 @@ async def admin_eco_info(interaction: discord.Interaction, joueur: discord.Membe
         return
     """Affiche les informations économiques détaillées d'un joueur"""
     try:
-        conn = await asyncpg.connect(DATABASE_URL)
+        # Utilisation du DatabaseManager déjà initialisé
         
         # Récupérer les infos du joueur
-        player_info = await conn.fetchrow("SELECT * FROM players WHERE discord_id = $1", joueur.id)
+        player_info = await db.fetchrow("SELECT * FROM players WHERE discord_id = %s", joueur.id)
         
         if not player_info:
             await interaction.response.send_message(f"❌ {joueur.mention} n'a pas de compte.", ephemeral=True)
-            await conn.close()
+            # Plus besoin de fermer avec le DatabaseManager
             return
         
         # Récupérer les dernières transactions
-        recent_transactions = await conn.fetch("""
+        recent_transactions = await db.fetch("""
             SELECT amount, transaction_type, description, created_at, admin_id
             FROM transactions 
-            WHERE to_user_id = $1 OR from_user_id = $1
+            WHERE to_user_id = %s OR from_user_id = %s
             ORDER BY created_at DESC 
             LIMIT 5
         """, joueur.id)
         
-        await conn.close()
+        # Plus besoin de fermer avec le DatabaseManager
         
         embed = discord.Embed(
             title=f"📊 Infos Économiques - {joueur.display_name}",
@@ -1432,7 +1428,7 @@ async def admin_eco_info(interaction: discord.Interaction, joueur: discord.Membe
         
         await interaction.response.send_message(embed=embed, ephemeral=True)
         
-    except asyncpg.exceptions.PostgresError as e:
+    except aiomysql.Error as e:
         await interaction.response.send_message(f"❌ Erreur base de données : {e}", ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(f"❌ Erreur inattendue : {e}", ephemeral=True)
@@ -1442,11 +1438,11 @@ async def admin_eco_info(interaction: discord.Interaction, joueur: discord.Membe
 async def check_balance(interaction: discord.Interaction):
     """Affiche le solde du joueur"""
     try:
-        conn = await asyncpg.connect(DATABASE_URL)
+        # Utilisation du DatabaseManager déjà initialisé
         
-        player_info = await conn.fetchrow("SELECT balance, ark_name FROM players WHERE discord_id = $1", interaction.user.id)
+        player_info = await db.fetchrow("SELECT balance, ark_name FROM players WHERE discord_id = %s", interaction.user.id)
         
-        await conn.close()
+        # Plus besoin de fermer avec le DatabaseManager
         
         if not player_info:
             embed = discord.Embed(
@@ -1467,7 +1463,7 @@ async def check_balance(interaction: discord.Interaction):
         
         await interaction.response.send_message(embed=embed, ephemeral=True)
         
-    except asyncpg.exceptions.PostgresError as e:
+    except aiomysql.Error as e:
         await interaction.response.send_message(f"❌ Erreur base de données : {e}", ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(f"❌ Erreur inattendue : {e}", ephemeral=True)
@@ -1479,22 +1475,22 @@ async def register(interaction: discord.Interaction, pseudo: str):
         return
     
     try:
-        conn = await asyncpg.connect(DATABASE_URL)
-        await conn.execute("""
+        # Utilisation du DatabaseManager déjà initialisé
+        await db.execute("""
             INSERT INTO players (discord_id, username, ark_name, balance)
-            VALUES ($1, $2, $3, 0)
-            ON CONFLICT (discord_id) DO UPDATE SET 
-                ark_name = $3,
-                username = $2,
+            VALUES (%s, %s, %s, 0)
+            ON DUPLICATE KEY UPDATE 
+                ark_name = %s,
+                username = %s,
                 updated_at = NOW()
         """, interaction.user.id, interaction.user.name, pseudo.strip())
-        await conn.close()
+        # Plus besoin de fermer avec le DatabaseManager
 
         await interaction.response.send_message(
             f"✅ Ton compte a été enregistré avec le pseudo **{pseudo.strip()}**.",
             ephemeral=True
         )
-    except asyncpg.exceptions.PostgresError as e:
+    except aiomysql.Error as e:
         await interaction.response.send_message(f"❌ Erreur base de données : {e}", ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(f"❌ Erreur inattendue : {e}", ephemeral=True)
@@ -1632,16 +1628,16 @@ async def create_tribe(interaction: discord.Interaction, name: str, leader: disc
     try:
         async with db.get_connection() as conn:
             # Vérifier si la tribu existe déjà
-            existing = await conn.fetchval("SELECT id FROM tribes WHERE name = $1", name)
+            existing = await db.fetchval("SELECT id FROM tribes WHERE name = %s", name)
             if existing:
                 await interaction.response.send_message(f"❌ Une tribu nommée **{name}** existe déjà.", ephemeral=True)
                 return
             
             # Vérifier si le leader est déjà dans une tribu
-            existing_membership = await conn.fetchval("""
+            existing_membership = await db.fetchval("""
                 SELECT t.name FROM tribes t
                 JOIN tribe_members tm ON t.id = tm.tribe_id
-                WHERE tm.user_id = $1
+                WHERE tm.user_id = %s
             """, leader.id)
             
             if existing_membership:
@@ -1649,16 +1645,16 @@ async def create_tribe(interaction: discord.Interaction, name: str, leader: disc
                 return
             
             # Créer la tribu
-            tribe_id = await conn.fetchval("""
+            tribe_id = await db.fetchval("""
                 INSERT INTO tribes (name, leader_id, description)
-                VALUES ($1, $2, $3)
+                VALUES (%s, %s, %s)
                 RETURNING id
             """, name, leader.id, description)
             
             # Ajouter le leader comme membre
-            await conn.execute("""
+            await db.execute("""
                 INSERT INTO tribe_members (tribe_id, user_id, role)
-                VALUES ($1, $2, 'leader')
+                VALUES (%s, %s, 'leader')
             """, tribe_id, leader.id)
             
         embed = EmbedBuilder.success(
@@ -1685,16 +1681,16 @@ async def delete_tribe(interaction: discord.Interaction, name: str):
     try:
         async with db.get_connection() as conn:
             # Récupérer les infos de la tribu
-            tribe = await conn.fetchrow("SELECT id, name, leader_id FROM tribes WHERE name = $1", name)
+            tribe = await db.fetchrow("SELECT id, name, leader_id FROM tribes WHERE name = %s", name)
             if not tribe:
                 await interaction.response.send_message(f"❌ Aucune tribu nommée **{name}** trouvée.", ephemeral=True)
                 return
             
             # Compter les membres
-            member_count = await conn.fetchval("SELECT COUNT(*) FROM tribe_members WHERE tribe_id = $1", tribe['id'])
+            member_count = await db.fetchval("SELECT COUNT(*) FROM tribe_members WHERE tribe_id = %s", tribe['id'])
             
             # Supprimer la tribu (cascade supprime les membres)
-            await conn.execute("DELETE FROM tribes WHERE id = $1", tribe['id'])
+            await db.execute("DELETE FROM tribes WHERE id = %s", tribe['id'])
             
         embed = EmbedBuilder.success(
             title="Tribu Supprimée !",
@@ -1721,16 +1717,16 @@ async def add_tribe_member(interaction: discord.Interaction, tribe_name: str, me
     try:
         async with db.get_connection() as conn:
             # Vérifier si la tribu existe
-            tribe = await conn.fetchrow("SELECT id, name FROM tribes WHERE name = $1", tribe_name)
+            tribe = await db.fetchrow("SELECT id, name FROM tribes WHERE name = %s", tribe_name)
             if not tribe:
                 await interaction.response.send_message(f"❌ Aucune tribu nommée **{tribe_name}** trouvée.", ephemeral=True)
                 return
             
             # Vérifier si le membre est déjà dans une tribu
-            existing = await conn.fetchval("""
+            existing = await db.fetchval("""
                 SELECT t.name FROM tribes t
                 JOIN tribe_members tm ON t.id = tm.tribe_id
-                WHERE tm.user_id = $1
+                WHERE tm.user_id = %s
             """, member.id)
             
             if existing:
@@ -1738,9 +1734,9 @@ async def add_tribe_member(interaction: discord.Interaction, tribe_name: str, me
                 return
             
             # Ajouter le membre
-            await conn.execute("""
+            await db.execute("""
                 INSERT INTO tribe_members (tribe_id, user_id, role)
-                VALUES ($1, $2, 'member')
+                VALUES (%s, %s, 'member')
             """, tribe['id'], member.id)
             
         embed = EmbedBuilder.success(
@@ -1763,11 +1759,11 @@ async def remove_tribe_member(interaction: discord.Interaction, member: discord.
     try:
         async with db.get_connection() as conn:
             # Récupérer la tribu du membre
-            tribe_info = await conn.fetchrow("""
+            tribe_info = await db.fetchrow("""
                 SELECT t.name, t.id, tm.role
                 FROM tribes t
                 JOIN tribe_members tm ON t.id = tm.tribe_id
-                WHERE tm.user_id = $1
+                WHERE tm.user_id = %s
             """, member.id)
             
             if not tribe_info:
@@ -1776,13 +1772,13 @@ async def remove_tribe_member(interaction: discord.Interaction, member: discord.
             
             # Vérifier si c'est le leader
             if tribe_info['role'] == 'leader':
-                member_count = await conn.fetchval("SELECT COUNT(*) FROM tribe_members WHERE tribe_id = $1", tribe_info['id'])
+                member_count = await db.fetchval("SELECT COUNT(*) FROM tribe_members WHERE tribe_id = %s", tribe_info['id'])
                 if member_count > 1:
                     await interaction.response.send_message(f"❌ Impossible de retirer le leader s'il y a d'autres membres. Supprimez la tribu ou transférez le leadership.", ephemeral=True)
                     return
             
             # Retirer le membre
-            await conn.execute("DELETE FROM tribe_members WHERE user_id = $1", member.id)
+            await db.execute("DELETE FROM tribe_members WHERE user_id = %s", member.id)
             
         embed = EmbedBuilder.success(
             title="Membre Retiré !",
@@ -1800,7 +1796,7 @@ async def remove_tribe_member(interaction: discord.Interaction, member: discord.
 async def list_tribes(interaction: discord.Interaction):
     try:
         async with db.get_connection() as conn:
-            tribes = await conn.fetch("""
+            tribes = await db.fetch("""
                 SELECT t.name, t.leader_id, t.description, t.created_at,
                        COUNT(tm.user_id) as member_count
                 FROM tribes t
@@ -1841,7 +1837,7 @@ async def tribe_info(interaction: discord.Interaction, name: str = None):
         async with db.get_connection() as conn:
             if name:
                 # Tribu spécifiée
-                tribe = await conn.fetchrow("SELECT * FROM tribes WHERE name = $1", name)
+                tribe = await db.fetchrow("SELECT * FROM tribes WHERE name = %s", name)
                 if not tribe:
                     await interaction.response.send_message(f"❌ Aucune tribu nommée **{name}** trouvée.", ephemeral=True)
                     return
@@ -1853,7 +1849,7 @@ async def tribe_info(interaction: discord.Interaction, name: str = None):
                     await interaction.response.send_message("❌ Vous n'êtes membre d'aucune tribu.", ephemeral=True)
                     return
                 tribe_id = user_tribe['id']
-                tribe = await conn.fetchrow("SELECT * FROM tribes WHERE id = $1", tribe_id)
+                tribe = await db.fetchrow("SELECT * FROM tribes WHERE id = %s", tribe_id)
             
             # Récupérer les membres
             members = await get_tribe_members(tribe_id)
@@ -2074,7 +2070,7 @@ async def init_db():
     """Initialise la base de données avec le gestionnaire optimisé"""
     async with db.get_connection() as conn:
         # Table des joueurs (structure simplifiée)
-        await conn.execute("""
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS players (
                 id SERIAL PRIMARY KEY,
                 discord_id BIGINT UNIQUE NOT NULL,
@@ -2087,7 +2083,7 @@ async def init_db():
         """)
         
         # Table des enchères
-        await conn.execute("""
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS auctions (
                 id SERIAL PRIMARY KEY,
                 dino_name TEXT NOT NULL,
@@ -2100,7 +2096,7 @@ async def init_db():
         """)
         
         # Table de l'historique des enchères
-        await conn.execute("""
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS auction_history (
                 id SERIAL PRIMARY KEY,
                 user_id BIGINT NOT NULL,
@@ -2112,7 +2108,7 @@ async def init_db():
         """)
         
         # Table des transactions économiques
-        await conn.execute("""
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS transactions (
                 id SERIAL PRIMARY KEY,
                 from_user_id BIGINT,
@@ -2126,7 +2122,7 @@ async def init_db():
         """)
         
         # Table des enchères actives pour récupération après redémarrage
-        await conn.execute("""
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS active_auctions (
                 thread_id BIGINT PRIMARY KEY,
                 auction_data JSONB NOT NULL,
@@ -2136,7 +2132,7 @@ async def init_db():
         """)
         
         # Table des tribus
-        await conn.execute("""
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS tribes (
                 id SERIAL PRIMARY KEY,
                 name TEXT UNIQUE NOT NULL,
@@ -2148,7 +2144,7 @@ async def init_db():
         """)
         
         # Table des membres de tribus
-        await conn.execute("""
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS tribe_members (
                 id SERIAL PRIMARY KEY,
                 tribe_id INTEGER REFERENCES tribes(id) ON DELETE CASCADE,
@@ -2160,19 +2156,19 @@ async def init_db():
         """)
         
         # Suppression des anciennes tables (migration vers players unifiée)
-        await conn.execute("DROP TABLE IF EXISTS user_currency CASCADE")
-        await conn.execute("DROP TABLE IF EXISTS user_profiles CASCADE")
-        await conn.execute("DROP TABLE IF EXISTS aqualis_transactions CASCADE")
+        await db.execute("DROP TABLE IF EXISTS user_currency CASCADE")
+        await db.execute("DROP TABLE IF EXISTS user_profiles CASCADE")
+        await db.execute("DROP TABLE IF EXISTS aqualis_transactions CASCADE")
         
         # Vérifier que la table players a tous les champs nécessaires
         try:
-            await conn.execute("""
+            await db.execute("""
                 ALTER TABLE players 
                 ADD COLUMN IF NOT EXISTS username TEXT,
                 ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW(),
                 ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()
             """)
-        except asyncpg.exceptions.PostgresError:
+        except aiomysql.Error:
             # Les colonnes existent déjà
             pass
         
