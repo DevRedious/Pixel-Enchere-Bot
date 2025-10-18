@@ -1,5 +1,5 @@
 import os
-import asyncpg
+import aiomysql
 import httpx
 import secrets
 import logging
@@ -58,8 +58,21 @@ class DatabasePool:
         if not DATABASE_URL:
             raise HTTPException(status_code=500, detail="Database URL not configured")
         
-        self.pool = await asyncpg.create_pool(DATABASE_URL, min_size=5, max_size=20)
-        logger.info("Database pool initialized")
+        # Parse MySQL URL
+        from urllib.parse import urlparse
+        parsed = urlparse(DATABASE_URL)
+        
+        self.pool = await aiomysql.create_pool(
+            host=parsed.hostname,
+            port=parsed.port or 3306,
+            user=parsed.username,
+            password=parsed.password,
+            db=parsed.path[1:],  # Remove leading slash
+            minsize=5,
+            maxsize=20,
+            autocommit=True
+        )
+        logger.info("MySQL pool initialized")
     
     async def get_connection(self):
         if not self.pool:
@@ -147,22 +160,31 @@ app.add_middleware(ImprovedSecurityMiddleware)
 async def execute_db_query(query: str, *args):
     """Execute database query with pool"""
     async with await db_pool.get_connection() as conn:
-        return await conn.execute(query, *args)
+        async with conn.cursor() as cursor:
+            await cursor.execute(query, args)
+            return cursor.rowcount
 
 async def fetch_db_row(query: str, *args):
     """Fetch single row with pool"""
     async with await db_pool.get_connection() as conn:
-        return await conn.fetchrow(query, *args)
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute(query, args)
+            return await cursor.fetchone()
 
 async def fetch_db_all(query: str, *args):
     """Fetch all rows with pool"""
     async with await db_pool.get_connection() as conn:
-        return await conn.fetch(query, *args)
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute(query, args)
+            return await cursor.fetchall()
 
 async def fetch_db_val(query: str, *args):
     """Fetch single value with pool"""
     async with await db_pool.get_connection() as conn:
-        return await conn.fetchval(query, *args)
+        async with conn.cursor() as cursor:
+            await cursor.execute(query, args)
+            row = await cursor.fetchone()
+            return row[0] if row else None
 
 # =============================================
 # VARIABLES GLOBALES - GARDÉES IDENTIQUES
@@ -218,10 +240,10 @@ class TokenManager:
 
     @staticmethod
     async def save_refresh_token(discord_id: str, refresh_token: str) -> None:
-        await execute_db_query("DELETE FROM refresh_tokens WHERE discord_id = $1", int(discord_id))
+        await execute_db_query("DELETE FROM refresh_tokens WHERE discord_id = %s", int(discord_id))
         await execute_db_query(
             """INSERT INTO refresh_tokens (discord_id, token, expires_at) 
-               VALUES ($1, $2, $3)""",
+               VALUES (%s, %s, %s)""",
             int(discord_id), refresh_token, datetime.utcnow() + timedelta(days=30)
         )
 
@@ -229,14 +251,14 @@ class TokenManager:
     async def verify_refresh_token(refresh_token: str) -> Optional[str]:
         result = await fetch_db_row(
             """SELECT discord_id FROM refresh_tokens 
-               WHERE token = $1 AND expires_at > $2""",
+               WHERE token = %s AND expires_at > %s""",
             refresh_token, datetime.utcnow()
         )
         return str(result["discord_id"]) if result else None
 
     @staticmethod
     async def revoke_refresh_token(refresh_token: str) -> None:
-        await execute_db_query("DELETE FROM refresh_tokens WHERE token = $1", refresh_token)
+        await execute_db_query("DELETE FROM refresh_tokens WHERE token = %s", refresh_token)
 
 # =============================================
 # AUTHENTICATION HELPERS - GARDÉS IDENTIQUES
@@ -267,7 +289,7 @@ async def get_current_user(request: Request, credentials: HTTPAuthorizationCrede
     # Enrichir avec les données DB
     try:
         db_user = await fetch_db_row(
-            "SELECT ark_name, balance FROM players WHERE discord_id = $1", 
+            "SELECT ark_name, balance FROM players WHERE discord_id = %s", 
             int(user_data["discord_id"])
         )
         if db_user:
@@ -356,10 +378,8 @@ async def discord_callback(code: str, error: Optional[str] = None):
             # Create or update user
             await execute_db_query("""
                 INSERT INTO players (discord_id, username, ark_name, balance)
-                VALUES ($1, $2, $3, 0)
-                ON CONFLICT (discord_id) DO UPDATE SET 
-                    username = $2,
-                    updated_at = CURRENT_TIMESTAMP
+                VALUES (%s, %s, %s, 0)
+                ON DUPLICATE KEY UPDATE username = VALUES(username), updated_at = NOW()
             """, int(user_data["id"]), user_data["username"], user_data["username"])
             
             # Create tokens
@@ -451,7 +471,7 @@ async def refresh_access_token(request: Request):
     
     # Get user data
     user_data = await fetch_db_row(
-        "SELECT discord_id, username FROM players WHERE discord_id = $1",
+        "SELECT discord_id, username FROM players WHERE discord_id = %s",
         int(discord_id)
     )
     
@@ -528,16 +548,15 @@ async def get_user_profile(current_user: dict = Depends(get_current_user)):
         
         user_stats = await fetch_db_row("""
             SELECT ark_name, balance,
-                   (SELECT COUNT(*) FROM auction_history WHERE user_id = $1 AND won = true) as wins,
-                   (SELECT COUNT(*) FROM auction_history WHERE user_id = $1) as total_auctions
-            FROM players WHERE discord_id = $1
+                   (SELECT COUNT(*) FROM auction_history WHERE user_id = %s AND won = true) as wins,
+                   (SELECT COUNT(*) FROM auction_history WHERE user_id = %s) as total_auctions
+            FROM players WHERE discord_id = %s
         """, discord_id)
         
         if not user_stats:
             # Create user if doesn't exist
             await execute_db_query("""
-                INSERT INTO players (discord_id, username, balance) VALUES ($1, $2, 0)
-                ON CONFLICT (discord_id) DO NOTHING
+                INSERT IGNORE INTO players (discord_id, username, balance) VALUES (%s, %s, 0)
             """, discord_id, current_user["username"])
             
             user_stats = {"ark_name": None, "balance": 0, "wins": 0, "total_auctions": 0}
@@ -545,7 +564,7 @@ async def get_user_profile(current_user: dict = Depends(get_current_user)):
         # Get rank
         rank = await fetch_db_val("""
             SELECT COUNT(*) + 1 FROM players 
-            WHERE balance > $1 AND balance > 0
+            WHERE balance > %s AND balance > 0
         """, user_stats["balance"])
         
         avatar_url = None
@@ -575,7 +594,7 @@ async def get_user_auction_history(current_user: dict = Depends(get_current_user
         history = await fetch_db_all("""
             SELECT dino_name, final_price, won, created_at
             FROM auction_history 
-            WHERE user_id = $1 
+            WHERE user_id = %s 
             ORDER BY created_at DESC 
             LIMIT 20
         """, int(current_user["discord_id"]))
@@ -598,8 +617,8 @@ async def update_ark_name(request: Request, current_user: dict = Depends(get_cur
             raise ValidationError("ARK name invalid (min 3 characters)")
         
         await execute_db_query("""
-            UPDATE players SET ark_name = $1, updated_at = CURRENT_TIMESTAMP 
-            WHERE discord_id = $2
+            UPDATE players SET ark_name = %s, updated_at = NOW() 
+            WHERE discord_id = %s
         """, ark_name, int(current_user["discord_id"]))
         
         return {"message": "ARK name updated", "ark_name": ark_name}
@@ -621,14 +640,13 @@ async def get_user_aqualis(current_user: dict = Depends(get_current_user)):
         player_data = await fetch_db_row("""
             SELECT balance, ark_name, username
             FROM players 
-            WHERE discord_id = $1
+            WHERE discord_id = %s
         """, int(discord_id))
         
         if not player_data:
             await execute_db_query("""
-                INSERT INTO players (discord_id, username, balance)
-                VALUES ($1, $2, 0)
-                ON CONFLICT (discord_id) DO NOTHING
+                INSERT IGNORE INTO players (discord_id, username, balance)
+                VALUES (%s, %s, 0)
             """, int(discord_id), current_user.get("username", "User"))
             
             balance = 0
@@ -664,7 +682,7 @@ async def get_user_aqualis_test(user_id: str):
         discord_id = str(user_id)
         
         player_data = await fetch_db_row(
-            "SELECT balance FROM players WHERE discord_id = $1",
+            "SELECT balance FROM players WHERE discord_id = %s",
             int(discord_id)
         )
         
@@ -694,7 +712,7 @@ async def get_aqualis_leaderboard(limit: int = 10):
             FROM players
             WHERE balance > 0
             ORDER BY balance DESC
-            LIMIT $1
+            LIMIT %s
         """, limit)
         
         result = []
